@@ -1,0 +1,54 @@
+name: Release EnvSentry
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Go SDK
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Build Windows Binaries
+        run: |
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o dist/envsentry-windows-amd64.exe .
+          GOOS=windows GOARCH=386 go build -ldflags "-s -w" -o dist/envsentry-windows-386.exe .
+
+      - name: Build Linux Binaries
+        run: |
+          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o dist/envsentry-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o dist/envsentry-linux-arm64 .
+
+      - name: Build macOS Binaries
+        run: |
+          GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o dist/envsentry-darwin-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o dist/envsentry-darwin-arm64 .
+
+      - name: Publish GitHub Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          name: EnvSentry ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/envsentry-windows-amd64.exe
+            dist/envsentry-windows-386.exe
+            dist/envsentry-linux-amd64
+            dist/envsentry-linux-arm64
+            dist/envsentry-darwin-amd64
+            dist/envsentry-darwin-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

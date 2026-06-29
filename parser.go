@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -12,15 +13,31 @@ import (
 type EnvVar struct {
 	Key          string
 	DefaultValue string
-	Type         string   // "int", "bool", "float", "string", "email", "url", "enum"
+	Type         string   // "int", "bool", "float", "string", "email", "url", "enum", or custom YAML types
 	EnumVals     []string // values for enum type
 	Optional     bool
 	Deprecated   bool
 	Comment      string
+
+	// Range validation (int/float bounds)
+	HasRange bool
+	RangeMin float64
+	RangeMax float64
+
+	// Length validation (string char count bounds)
+	HasLen bool
+	LenMin int
+	LenMax int
+
+	// Regular expression patterns validation
+	HasRegex     bool
+	RegexPattern string
 }
 
 var (
-	typeRegex = regexp.MustCompile(`type:([a-zA-Z0-9_]+(?:\([^)]*\))?)`)
+	typeRegex  = regexp.MustCompile(`type:([a-zA-Z0-9_]+(?:\([^)]*\))?)`)
+	rangeRegex = regexp.MustCompile(`range\(([^,]+),([^)]+)\)`)
+	lenRegex   = regexp.MustCompile(`len\(([^,]+),([^)]+)\)`)
 )
 
 // ParseEnvFile reads an env file and returns a map of Key -> EnvVar.
@@ -152,7 +169,6 @@ func parseValueAndComment(s string) (string, string) {
 
 // parseMetadata parses instructions from comments, like type:int, optional, deprecated.
 func parseMetadata(comment string, ev *EnvVar) {
-	// Lowercase for checking optional and deprecated
 	lowerComment := strings.ToLower(comment)
 
 	// Check optional status
@@ -179,6 +195,53 @@ func parseMetadata(comment string, ev *EnvVar) {
 			ev.EnumVals = vals
 		} else {
 			ev.Type = strings.ToLower(rawType)
+		}
+	}
+
+	// Parse range(min,max)
+	rangeMatches := rangeRegex.FindStringSubmatch(comment)
+	if len(rangeMatches) > 2 {
+		minVal, errMin := strconv.ParseFloat(strings.TrimSpace(rangeMatches[1]), 64)
+		maxVal, errMax := strconv.ParseFloat(strings.TrimSpace(rangeMatches[2]), 64)
+		if errMin == nil && errMax == nil {
+			ev.HasRange = true
+			ev.RangeMin = minVal
+			ev.RangeMax = maxVal
+		}
+	}
+
+	// Parse len(min,max)
+	lenMatches := lenRegex.FindStringSubmatch(comment)
+	if len(lenMatches) > 2 {
+		minVal, errMin := strconv.Atoi(strings.TrimSpace(lenMatches[1]))
+		maxVal, errMax := strconv.Atoi(strings.TrimSpace(lenMatches[2]))
+		if errMin == nil && errMax == nil {
+			ev.HasLen = true
+			ev.LenMin = minVal
+			ev.LenMax = maxVal
+		}
+	}
+
+	// Parse regex(pattern) using parenthesis matching to support embedded groups
+	if idx := strings.Index(comment, "regex("); idx != -1 {
+		start := idx + 6
+		depth := 1
+		end := -1
+		runes := []rune(comment[start:])
+		for i, r := range runes {
+			if r == '(' {
+				depth++
+			} else if r == ')' {
+				depth--
+				if depth == 0 {
+					end = start + i
+					break
+				}
+			}
+		}
+		if end != -1 {
+			ev.HasRegex = true
+			ev.RegexPattern = comment[start:end]
 		}
 	}
 }

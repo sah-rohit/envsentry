@@ -1,0 +1,35 @@
+# EnvSentry Configuration File
+# Configure directory-level defaults, custom types, and scripts hooks.
+
+# Default paths for commands
+env_file: "test_project/.env"
+example_file: "test_project/.env.example"
+
+# Strict mode default
+strict: false
+
+# Directory exclusions during auto-scanning
+exclude:
+  - "node_modules"
+  - ".git"
+  - "venv"
+  - "dist"
+  - "build"
+
+# Scan filter languages (default scans JavaScript/TypeScript and Python)
+# Options: javascript, typescript, python, go, rust, php, java, csharp
+languages:
+  - "javascript"
+  - "python"
+  - "go"
+  - "rust"
+  - "php"
+
+# Set keys to completely ignore during validation checks
+ignored_keys:
+  - "OPTIONAL_VALUE"
+
+# Custom regular expression types you can use in comments as '# type:uuid'
+custom_types:
+  uuid: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+  semver: "^v?(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"

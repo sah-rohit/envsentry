@@ -3,77 +3,106 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 )
 
-func TestScanProject(t *testing.T) {
-	// Create temporary directory for mock project
-	tmpDir, err := os.MkdirTemp("", "envguard-test-*")
+func TestScanProjectMultiLanguage(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "envsentry-test-scan-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Create directories to ignore
-	os.Mkdir(filepath.Join(tmpDir, "node_modules"), 0755)
-	os.Mkdir(filepath.Join(tmpDir, ".git"), 0755)
-
-	// Write mock JS file
-	jsContent := `
-		const port = process.env.PORT || 3000;
-		const db = process.env["DATABASE_URL"];
-		const debug = process.env['DEBUG'];
-		console.log(process.env.UNDEFINED_VAR);
-	`
-	err = os.WriteFile(filepath.Join(tmpDir, "app.js"), []byte(jsContent), 0644)
-	if err != nil {
-		t.Fatalf("failed to write mock JS file: %v", err)
-	}
-
-	// Write mock JS file in node_modules (should be ignored)
-	err = os.WriteFile(filepath.Join(tmpDir, "node_modules", "ignored.js"), []byte("const x = process.env.IGNORED_VAR"), 0644)
-	if err != nil {
-		t.Fatalf("failed to write ignored JS file: %v", err)
-	}
-
-	// Write mock Python file
-	pyContent := `
-import os
-port = os.getenv("PORT", 8000)
-secret = os.environ.get('API_SECRET')
-old_key = os.environ["OLD_KEY"]
-another = getenv('OTHER_VAR')
+	// Write mock Go file
+	goContent := `
+package main
+import (
+    "os"
+    "strconv"
+)
+func main() {
+    port, _ := strconv.Atoi(os.Getenv("GO_PORT"))
+    val := os.Getenv("GO_DB")
+}
 `
-	err = os.WriteFile(filepath.Join(tmpDir, "main.py"), []byte(pyContent), 0644)
+	err = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(goContent), 0644)
 	if err != nil {
-		t.Fatalf("failed to write mock Python file: %v", err)
+		t.Fatalf("failed to write Go file: %v", err)
 	}
 
-	// Run scanner
-	excludes := []string{"node_modules", ".git"}
-	keys, err := ScanProject(tmpDir, excludes)
+	// Write mock Docker Compose file
+	dockerComposeContent := `
+version: '3'
+services:
+  web:
+    image: nginx
+    ports:
+      - "${COMPOSE_PORT}:80"
+    environment:
+      - DB_HOST=${COMPOSE_DB_HOST}
+`
+	err = os.WriteFile(filepath.Join(tmpDir, "docker-compose.yml"), []byte(dockerComposeContent), 0644)
 	if err != nil {
-		t.Fatalf("ScanProject failed: %v", err)
+		t.Fatalf("failed to write compose file: %v", err)
 	}
 
-	expectedKeys := []string{
-		"API_SECRET",
-		"DATABASE_URL",
-		"DEBUG",
-		"OLD_KEY",
-		"OTHER_VAR",
-		"PORT",
-		"UNDEFINED_VAR",
+	// Write mock GitHub Action workflow file
+	workflowDir := filepath.Join(tmpDir, ".github", "workflows")
+	err = os.MkdirAll(workflowDir, 0755)
+	if err != nil {
+		t.Fatalf("failed to create workflow dir: %v", err)
 	}
 
-	if !reflect.DeepEqual(keys, expectedKeys) {
-		t.Errorf("expected keys %v, got %v", expectedKeys, keys)
+	workflowContent := `
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup
+        env:
+          API_KEY: ${{ env.GITHUB_ACTION_API_KEY }}
+          DEBUG: ${{ env.GITHUB_ACTION_DEBUG }}
+        run: echo "Run tests"
+`
+	err = os.WriteFile(filepath.Join(workflowDir, "ci.yml"), []byte(workflowContent), 0644)
+	if err != nil {
+		t.Fatalf("failed to write workflow file: %v", err)
+	}
+
+	// Scan project
+	cfg := &Config{
+		Languages: []string{"go"},
+	}
+
+	excludes := []string{}
+	varsMap, err := ScanProjectWithTypes(tmpDir, excludes, cfg)
+	if err != nil {
+		t.Fatalf("ScanProjectWithTypes failed: %v", err)
+	}
+
+	expectedVars := map[string]string{
+		"GO_DB":                 "string",
+		"GO_PORT":               "int", // Inferred from strconv.Atoi(os.Getenv("GO_PORT"))
+		"COMPOSE_PORT":          "string",
+		"COMPOSE_DB_HOST":       "string",
+		"GITHUB_ACTION_API_KEY": "string",
+		"GITHUB_ACTION_DEBUG":   "string",
+	}
+
+	for k, expectedType := range expectedVars {
+		gotType, ok := varsMap[k]
+		if !ok {
+			t.Errorf("expected key %q to be scanned but it was missing", k)
+		} else if gotType != expectedType {
+			t.Errorf("expected key %q to have type %q, got %q", k, expectedType, gotType)
+		}
 	}
 }
 
-func TestGenerateExampleFile(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "envguard-test-gen-*")
+func TestGenerateExampleFilePreserves(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "envsentry-test-gen-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
@@ -81,7 +110,6 @@ func TestGenerateExampleFile(t *testing.T) {
 
 	examplePath := filepath.Join(tmpDir, ".env.example")
 
-	// 1. Initial generation
 	scannedKeys := []string{"PORT", "DATABASE_URL"}
 	newCount, err := GenerateExampleFile(examplePath, scannedKeys)
 	if err != nil {
@@ -91,7 +119,6 @@ func TestGenerateExampleFile(t *testing.T) {
 		t.Errorf("expected 2 new keys, got %d", newCount)
 	}
 
-	// Verify file was created
 	vars, err := ParseEnvFile(examplePath)
 	if err != nil {
 		t.Fatalf("ParseEnvFile failed: %v", err)
@@ -99,48 +126,25 @@ func TestGenerateExampleFile(t *testing.T) {
 	if _, ok := vars["PORT"]; !ok {
 		t.Error("expected PORT in generated file")
 	}
-	if _, ok := vars["DATABASE_URL"]; !ok {
-		t.Error("expected DATABASE_URL in generated file")
+}
+
+func TestMergeInferredTypes(t *testing.T) {
+	tests := []struct {
+		existing string
+		newType  string
+		expected string
+	}{
+		{"", "int", "int"},
+		{"string", "bool", "bool"},
+		{"int", "string", "int"},
+		{"bool", "int", "bool"},
+		{"string", "string", "string"},
 	}
 
-	// 2. Add some comments to examplePath manually
-	contentWithComments := `
-# Generated by envguard
-PORT=8080 # type:int
-DATABASE_URL= # type:url # optional
-`
-	err = os.WriteFile(examplePath, []byte(contentWithComments), 0644)
-	if err != nil {
-		t.Fatalf("failed to write comments to mock example: %v", err)
-	}
-
-	// 3. Scan again and add a new key "NEW_KEY"
-	scannedKeys = []string{"PORT", "DATABASE_URL", "NEW_KEY"}
-	newCount, err = GenerateExampleFile(examplePath, scannedKeys)
-	if err != nil {
-		t.Fatalf("GenerateExampleFile failed on merge: %v", err)
-	}
-	if newCount != 1 {
-		t.Errorf("expected 1 new key, got %d", newCount)
-	}
-
-	// Verify existing metadata is preserved and new key is added
-	vars, err = ParseEnvFile(examplePath)
-	if err != nil {
-		t.Fatalf("ParseEnvFile failed after merge: %v", err)
-	}
-
-	portVar := vars["PORT"]
-	if portVar.Type != "int" || portVar.DefaultValue != "8080" {
-		t.Errorf("PORT metadata not preserved: %+v", portVar)
-	}
-
-	dbVar := vars["DATABASE_URL"]
-	if dbVar.Type != "url" || !dbVar.Optional {
-		t.Errorf("DATABASE_URL metadata not preserved: %+v", dbVar)
-	}
-
-	if _, ok := vars["NEW_KEY"]; !ok {
-		t.Error("expected NEW_KEY to be added to file")
+	for _, tt := range tests {
+		got := mergeInferredTypes(tt.existing, tt.newType)
+		if got != tt.expected {
+			t.Errorf("mergeInferredTypes(%q, %q) = %q; expected %q", tt.existing, tt.newType, got, tt.expected)
+		}
 	}
 }

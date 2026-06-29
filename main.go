@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -56,23 +57,33 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  validate   Validates your .env file against a schema definition in .env.example")
-	fmt.Println("  generate   Recursively scans JS, TS, and Python code to auto-generate or merge .env.example")
+	fmt.Println("  generate   Recursively scans JS, TS, Python, etc. code to auto-generate or merge .env.example")
+	fmt.Println("  audit      Runs a static security audit on directories to find leaked keys and permission risks")
 	fmt.Println("  version    Prints EnvSentry version")
 	fmt.Println()
 	fmt.Println("Use \"envsentry <command> --help\" for more info about a command.")
 }
 
 func main() {
-	// If arguments are passed, bypass interactive menu (great for CI/CD and scripts)
+	// Load configuration defaults on startup
+	cfg, err := FindAndLoadConfig()
+	if err != nil {
+		fmt.Printf("%s⚠️  Warning loading envsentry.yaml: %v%s\n", colorYellow, err, colorReset)
+		cfg = DefaultConfig()
+	}
+
+	// If arguments are passed, bypass interactive menu
 	if len(os.Args) >= 2 {
 		command := os.Args[1]
 		switch command {
 		case "validate":
-			runValidate(os.Args[2:])
+			runValidate(os.Args[2:], cfg)
 		case "generate", "scan":
-			runGenerate(os.Args[2:])
+			runGenerate(os.Args[2:], cfg)
+		case "audit":
+			runAuditSubcommand(os.Args[2:], cfg)
 		case "version":
-			fmt.Println("envsentry v1.0.0")
+			fmt.Println("envsentry v1.1.0")
 		case "help", "-h", "--help":
 			printHelp()
 		default:
@@ -84,7 +95,7 @@ func main() {
 	}
 
 	// Run interactive selector when executed with no arguments
-	runInteractiveMenu()
+	runInteractiveMenu(cfg)
 }
 
 func clearScreen() {
@@ -98,10 +109,17 @@ func clearScreen() {
 	cmd.Run()
 }
 
-func printDashboard() {
+func printDashboard(cfg *Config) {
 	clearScreen()
+	configLoaded := "Default configuration"
+	if _, err := os.Stat("envsentry.yaml"); err == nil {
+		configLoaded = "Loaded envsentry.yaml"
+	} else if _, err := os.Stat(".envsentry.yaml"); err == nil {
+		configLoaded = "Loaded .envsentry.yaml"
+	}
+
 	logo := fmt.Sprintf(`%s ┌────────────────────────────────────────────────────────────────────────────────────────┐
- │  EnvSentry v1.0.0                                                                      │
+ │  EnvSentry v1.1.0                                                                      │
  │                                                                                        │
  │  ███████╗███╗   ██╗██╗   ██╗███████╗███████╗███╗   ██╗████████╗██████╗  ██╗   ██╗      │
  │  ██╔════╝████╗  ██║██║   ██║██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗ ╚██╗ ██╔╝      │
@@ -113,10 +131,11 @@ func printDashboard() {
  ├──────────────────────────────────────────┬─────────────────────────────────────────────┤
  │ Security Status                          │ System Info                                 │
  │  ● Local Mode: Active                    │  ● Build: Lightweight Go                    │
- │  ● Transmission: None                    │  ● Execution time: <10ms                    │
+ │  ● Transmission: None                    │  ● Config: %-32s │
  │  ● Privacy: Offline                      │  ● Platform: %-29s │
  └──────────────────────────────────────────┴─────────────────────────────────────────────┘%s`,
 		colorBold+colorCyan,
+		configLoaded,
 		runtime.GOOS+"/"+runtime.GOARCH,
 		colorReset,
 	)
@@ -154,6 +173,15 @@ func cleanPath(p string) string {
 		}
 	}
 	return strings.TrimSpace(p)
+}
+
+func fileContentsEqual(file1, file2 string) bool {
+	data1, err1 := os.ReadFile(file1)
+	data2, err2 := os.ReadFile(file2)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return string(data1) == string(data2)
 }
 
 func parseCommandLine(line string) []string {
@@ -198,18 +226,74 @@ func parseCommandLine(line string) []string {
 	return args
 }
 
-func runInteractiveMenu() {
+func printVisualProgress(numPass, numFail, numWarn int) {
+	total := numPass + numFail + numWarn
+	if total == 0 {
+		return
+	}
+
+	drawBar := func(label string, count int, color string) string {
+		const maxBars = 30
+		pct := float64(count) / float64(total)
+		barCount := int(pct * maxBars)
+		bars := strings.Repeat("|", barCount)
+		spaces := strings.Repeat(" ", maxBars-barCount)
+		return fmt.Sprintf("   %-6s [%s%s%s%s] %5.1f%% (%d/%d)", label, color, bars, colorReset, spaces, pct*100, count, total)
+	}
+
+	fmt.Println()
+	fmt.Println("📊  Status Breakdown:")
+	fmt.Println(drawBar("PASS", numPass, colorGreen))
+	fmt.Println(drawBar("FAIL", numFail, colorRed))
+	fmt.Println(drawBar("WARN", numWarn, colorYellow))
+}
+
+func printActionableSuggestions(results []ValidationResult) {
+	hasSuggestions := false
+	for _, r := range results {
+		if r.Status == StatusFail || r.Status == StatusWarn {
+			hasSuggestions = true
+			break
+		}
+	}
+
+	if !hasSuggestions {
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("%s💡 Actionable Recommendations:%s\n", colorCyan+colorBold, colorReset)
+	for _, r := range results {
+		if (r.Status == StatusFail || r.Status == StatusWarn) && r.Suggestion != "" {
+			var symbol string
+			if r.Status == StatusFail {
+				if strings.Contains(r.Message, "🚨") || strings.Contains(r.Message, "CRITICAL") {
+					symbol = fmt.Sprintf("%s🚨 CRITICAL%s", colorRed+colorBold, colorReset)
+				} else {
+					symbol = fmt.Sprintf("%s✖%s", colorRed, colorReset)
+				}
+			} else {
+				symbol = fmt.Sprintf("%s⚠️ %s", colorYellow, colorReset)
+			}
+			fmt.Printf("  %s  %s: %s\n", symbol, r.Key, r.Suggestion)
+		}
+	}
+}
+
+func runInteractiveMenu(cfg *Config) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		printDashboard()
+		printDashboard(cfg)
 		fmt.Printf("%s? What would you like to do?%s\n", colorBold, colorReset)
 		fmt.Println("  [1] 🛡️  Validate environment file (.env)")
 		fmt.Println("  [2] 🔍  Scan codebase & generate schema (.env.example)")
 		fmt.Println("  [3] 💻  Interactive Shell (advanced command input)")
 		fmt.Println("  [4] 🔒  View Security & Architecture Information")
-		fmt.Println("  [5] 👋  Exit")
+		fmt.Println("  [5] 📖  View CLI Command Manual (w/ examples)")
+		fmt.Println("  [6] 🛡️  Run Static Security Audit (Credentials & Permissions)")
+		fmt.Println("  [7] 👋  Exit")
 		fmt.Println()
-		fmt.Printf("%s👉 Select an option (1-5): %s", colorBold+colorCyan, colorReset)
+		fmt.Printf("%s👉 Select an option (1-7): %s", colorBold+colorCyan, colorReset)
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -219,14 +303,18 @@ func runInteractiveMenu() {
 
 		switch input {
 		case "1":
-			wizardValidate(reader)
+			wizardValidate(reader, cfg)
 		case "2":
-			wizardGenerate(reader)
+			wizardGenerate(reader, cfg)
 		case "3":
-			runInteractiveShell(reader)
+			runInteractiveShell(reader, cfg)
 		case "4":
 			wizardSecurityInfo(reader)
-		case "5", "exit", "quit":
+		case "5":
+			wizardCommandManual(reader)
+		case "6":
+			wizardAudit(reader, cfg)
+		case "7", "exit", "quit":
 			fmt.Printf("\n%s👋 Exiting EnvSentry. Stay secure!%s\n", colorGreen+colorBold, colorReset)
 			return
 		default:
@@ -241,7 +329,7 @@ func pressEnterToContinue(reader *bufio.Reader) {
 	_, _ = reader.ReadString('\n')
 }
 
-func wizardValidate(reader *bufio.Reader) {
+func wizardValidate(reader *bufio.Reader, cfg *Config) {
 	clearScreen()
 	fmt.Printf("%s🛡️  EnvSentry Validation Wizard%s\n", colorBold+colorCyan, colorReset)
 	fmt.Println("💡 Tip: You can drag & drop any file from File Explorer directly into this terminal window!")
@@ -249,7 +337,7 @@ func wizardValidate(reader *bufio.Reader) {
 	fmt.Println()
 
 	envFiles := detectEnvFiles()
-	selectedEnv := ".env"
+	selectedEnv := cfg.EnvFile
 
 	// 1. .env path selector
 	if len(envFiles) > 0 {
@@ -274,7 +362,7 @@ func wizardValidate(reader *bufio.Reader) {
 			}
 		}
 	} else {
-		fmt.Printf("📂 Enter path to .env file (or drag-and-drop) [default: .env]: ")
+		fmt.Printf("📂 Enter path to .env file (or drag-and-drop) [default: %s]: ", selectedEnv)
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 		if input == "back" || input == "b" {
@@ -286,7 +374,7 @@ func wizardValidate(reader *bufio.Reader) {
 	}
 
 	// 2. .env.example path selector
-	selectedSchema := ".env.example"
+	selectedSchema := cfg.ExampleFile
 	fmt.Println()
 	if len(envFiles) > 0 {
 		fmt.Println("🔍  Detected files for schema selection:")
@@ -310,7 +398,7 @@ func wizardValidate(reader *bufio.Reader) {
 			}
 		}
 	} else {
-		fmt.Printf("📂 Enter path to schema file (or drag-and-drop) [default: .env.example]: ")
+		fmt.Printf("📂 Enter path to schema file (or drag-and-drop) [default: %s]: ", selectedSchema)
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 		if input == "back" || input == "b" {
@@ -323,22 +411,29 @@ func wizardValidate(reader *bufio.Reader) {
 
 	// 3. Strict mode
 	fmt.Println()
-	fmt.Printf("⚠️  Enable strict mode? (fails on warnings) (y/N): ")
+	strictLabel := "N"
+	if cfg.Strict {
+		strictLabel = "Y"
+	}
+	fmt.Printf("⚠️  Enable strict mode? (fails on warnings) (y/N) [default: %s]: ", strictLabel)
 	strictInput, _ := reader.ReadString('\n')
 	strictInput = strings.ToLower(strings.TrimSpace(strictInput))
 	if strictInput == "back" || strictInput == "b" {
 		return
 	}
-	isStrict := strictInput == "y" || strictInput == "yes"
+	isStrict := cfg.Strict
+	if strictInput != "" {
+		isStrict = strictInput == "y" || strictInput == "yes"
+	}
 
 	// Execution
 	fmt.Println()
-	validateInteractive(selectedEnv, selectedSchema, isStrict)
+	validateInteractive(selectedEnv, selectedSchema, isStrict, cfg)
 
 	pressEnterToContinue(reader)
 }
 
-func wizardGenerate(reader *bufio.Reader) {
+func wizardGenerate(reader *bufio.Reader, cfg *Config) {
 	clearScreen()
 	fmt.Printf("%s🔍  EnvSentry Codebase Scan Wizard%s\n", colorBold+colorCyan, colorReset)
 	fmt.Println("Type 'back' or 'b' at any prompt to return to the dashboard menu.")
@@ -358,7 +453,8 @@ func wizardGenerate(reader *bufio.Reader) {
 	}
 
 	// 2. output file
-	fmt.Printf("📂 Enter output schema file [default: .env.example]: ")
+	selectedOutput := cfg.ExampleFile
+	fmt.Printf("📂 Enter output schema file [default: %s]: ", selectedOutput)
 	outputFile, _ := reader.ReadString('\n')
 	outputFile = strings.TrimSpace(outputFile)
 	if outputFile == "back" || outputFile == "b" {
@@ -367,28 +463,30 @@ func wizardGenerate(reader *bufio.Reader) {
 	if outputFile != "" {
 		outputFile = cleanPath(outputFile)
 	} else {
-		outputFile = ".env.example"
+		outputFile = selectedOutput
 	}
 
 	// 3. excludes
-	fmt.Printf("🚫 Exclude directories (comma-separated) [default: node_modules,.git,venv,__pycache__,dist,build]: ")
+	defaultExcludes := strings.Join(cfg.Exclude, ",")
+	fmt.Printf("🚫 Exclude directories (comma-separated) [default: %s]: ", defaultExcludes)
 	excludeInput, _ := reader.ReadString('\n')
 	excludeInput = strings.TrimSpace(excludeInput)
 	if excludeInput == "back" || excludeInput == "b" {
 		return
 	}
-	if excludeInput == "" {
-		excludeInput = "node_modules,.git,venv,__pycache__,dist,build"
+	var excludesList []string
+	if excludeInput != "" {
+		excludesList = strings.Split(excludeInput, ",")
+	} else {
+		excludesList = cfg.Exclude
 	}
-
-	excludesList := strings.Split(excludeInput, ",")
 	for i, e := range excludesList {
 		excludesList[i] = strings.TrimSpace(e)
 	}
 
 	fmt.Printf("\n%s🔍  Scanning %s recursively for variables...%s\n", colorCyan+colorBold, scanDir, colorReset)
 
-	scannedKeys, err := ScanProject(scanDir, excludesList)
+	scannedKeys, err := ScanProject(scanDir, excludesList, cfg)
 	if err != nil {
 		fmt.Printf("  %s✖%s  Error scanning project: %v\n", colorRed+colorBold, colorReset, err)
 		pressEnterToContinue(reader)
@@ -440,6 +538,80 @@ func wizardSecurityInfo(reader *bufio.Reader) {
 	pressEnterToContinue(reader)
 }
 
+func wizardCommandManual(reader *bufio.Reader) {
+	clearScreen()
+	fmt.Printf("%s📖  EnvSentry Command Manual & Reference Guide%s\n", colorBold+colorCyan, colorReset)
+	fmt.Println(strings.Repeat("─", 80))
+	fmt.Printf("%s1. Direct CLI Execution (Script / CI-CD Mode)%s\n", colorBold, colorReset)
+	fmt.Println("   • Validate env file:")
+	fmt.Println("     envsentry validate [--env <path>] [--example <path>] [--strict]")
+	fmt.Println("     Example: envsentry validate -e .env.prod -x .env.example --strict")
+	fmt.Println()
+	fmt.Println("   • Auto-scan source code and generate/merge schema:")
+	fmt.Println("     envsentry generate [--dir <path>] [--output <path>] [--exclude <folders>]")
+	fmt.Println("     Example: envsentry generate -d ./src -o .env.example -x \"node_modules,temp\"")
+	fmt.Println()
+	fmt.Println("   • Run static directory security audit:")
+	fmt.Println("     envsentry audit [--dir <path>]")
+	fmt.Println("     Example: envsentry audit -d ./")
+	fmt.Println()
+	fmt.Printf("%s2. Interactive Shell Commands%s\n", colorBold, colorReset)
+	fmt.Println("   • validate [-e <path>] [-x <path>] [--strict] - Checks variables")
+	fmt.Println("   • generate [-d <path>] [-o <path>]             - Gathers code properties")
+	fmt.Println("   • audit [-d <path>]                            - Runs workspace security checks")
+	fmt.Println("   • info                                         - View specs")
+	fmt.Println("   • clear                                        - Clears terminal screen")
+	fmt.Println("   • back / exit                                  - Returns to dashboard")
+	fmt.Println()
+	fmt.Printf("%s3. Trailing Comment Directive Specifications (.env.example)%s\n", colorBold, colorReset)
+	fmt.Println("   • # type:int                  - Integer value matching checks")
+	fmt.Println("   • # type:bool                 - Boolean constraints (true, false, yes, no, 1, 0)")
+	fmt.Println("   • # type:url                  - URL scheme validation checks")
+	fmt.Println("   • # type:email                - Valid email layout check")
+	fmt.Println("   • # type:enum(x,y,z)          - Matches one of listed options")
+	fmt.Println("   • # range(min,max)            - Lower/Upper bounds (e.g., range(1000,9999))")
+	fmt.Println("   • # len(min,max)              - String length limits (e.g., len(8,16))")
+	fmt.Println("   • # regex(pattern)            - Matches pattern formatting (supports groups)")
+	fmt.Println("   • # optional                  - Prevents missing field failures")
+	fmt.Println("   • # deprecated                - Warns if active in environment")
+	fmt.Println(strings.Repeat("─", 80))
+
+	pressEnterToContinue(reader)
+}
+
+func wizardAudit(reader *bufio.Reader, cfg *Config) {
+	clearScreen()
+	fmt.Printf("%s🛡️  EnvSentry Static Security Audit Wizard%s\n", colorBold+colorCyan, colorReset)
+	fmt.Println("💡 Tip: Enter any local directory or drag-and-drop it into this terminal window.")
+	fmt.Println("Type 'back' or 'b' at any prompt to return to the dashboard menu.")
+	fmt.Println()
+
+	fmt.Printf("📂 Enter directory to audit [default: .]: ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+	if input == "back" || input == "b" {
+		return
+	}
+
+	auditDir := "."
+	if input != "" {
+		auditDir = cleanPath(input)
+	}
+
+	fmt.Printf("\n🔍 Running security audit on directory: %s ...\n", auditDir)
+
+	findings, err := RunAudit(auditDir, cfg)
+	if err != nil {
+		fmt.Printf("%s✖  Error running security audit: %v%s\n", colorRed+colorBold, err, colorReset)
+		pressEnterToContinue(reader)
+		return
+	}
+
+	PrintAuditReport(findings)
+
+	pressEnterToContinue(reader)
+}
+
 func printSuggestions(input string) {
 	input = strings.TrimSpace(strings.ToLower(input))
 	if input == "" {
@@ -451,6 +623,7 @@ func printSuggestions(input string) {
 	}{
 		{"validate", "Validate env file against schema"},
 		{"generate", "Scan codebase and generate schema"},
+		{"audit",    "Run static security checks on directory"},
 		{"info",     "Display security specs and architecture"},
 		{"clear",    "Clear the terminal screen"},
 		{"back",     "Return to the dashboard menu"},
@@ -471,13 +644,14 @@ func printSuggestions(input string) {
 	}
 }
 
-func runInteractiveShell(reader *bufio.Reader) {
+func runInteractiveShell(reader *bufio.Reader, cfg *Config) {
 	clearScreen()
 	fmt.Printf("%s💻  EnvSentry Interactive Command Shell%s\n", colorBold+colorCyan, colorReset)
 	fmt.Println("Type commands below. Type 'back' or 'exit' to return to the dashboard.")
 	fmt.Println("Suggestions / Shortcuts: ")
 	fmt.Println("  ● type 'v' or 'validate' to validate env")
 	fmt.Println("  ● type 'g' or 'generate' to scan codebase")
+	fmt.Println("  ● type 'a' or 'audit' to run security audit")
 	fmt.Println("  ● type 'info' to read security specs")
 	fmt.Println("  ● type 'clear' to clear terminal screen")
 	fmt.Println()
@@ -491,7 +665,7 @@ func runInteractiveShell(reader *bufio.Reader) {
 		input = strings.TrimSpace(input)
 		parts := parseCommandLine(input)
 		if len(parts) == 0 {
-			fmt.Println("Available commands: [validate, generate, info, clear, back]")
+			fmt.Println("Available commands: [validate, generate, audit, info, clear, back]")
 			continue
 		}
 
@@ -505,6 +679,9 @@ func runInteractiveShell(reader *bufio.Reader) {
 		} else if cmd == "g" {
 			fmt.Println("Matching shortcut 'g' -> 'generate'...")
 			cmd = "generate"
+		} else if cmd == "a" {
+			fmt.Println("Matching shortcut 'a' -> 'audit'...")
+			cmd = "audit"
 		} else if cmd == "i" {
 			fmt.Println("Matching shortcut 'i' -> 'info'...")
 			cmd = "info"
@@ -514,9 +691,11 @@ func runInteractiveShell(reader *bufio.Reader) {
 
 		switch cmd {
 		case "validate":
-			runValidateInteractiveShell(cmdArgs)
+			runValidateInteractiveShell(cmdArgs, cfg)
 		case "generate", "scan":
-			runGenerateInteractiveShell(cmdArgs)
+			runGenerateInteractiveShell(cmdArgs, cfg)
+		case "audit":
+			runAuditInteractiveShell(cmdArgs, cfg)
 		case "info":
 			fmt.Println("Local Offline Mode. Memory-only parsing. Lightweight (<10ms execution).")
 		case "clear":
@@ -526,6 +705,7 @@ func runInteractiveShell(reader *bufio.Reader) {
 			fmt.Println("Commands:")
 			fmt.Println("  validate [--env <path>] [--example <path>] [--strict] - Run validation checks")
 			fmt.Println("  generate [--dir <path>] [--output <path>]             - Scan codebase for envs")
+			fmt.Println("  audit [--dir <path>]                                  - Runs static directory security audit")
 			fmt.Println("  info                                                  - Display specifications")
 			fmt.Println("  clear                                                 - Clear terminal screen")
 			fmt.Println("  back / exit                                           - Return to dashboard")
@@ -540,7 +720,7 @@ func runInteractiveShell(reader *bufio.Reader) {
 }
 
 // Interactive helper that returns status instead of os.Exit
-func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
+func validateInteractive(envFile, schemaFile string, isStrict bool, cfg *Config) bool {
 	// Check if example file exists
 	if _, err := os.Stat(schemaFile); os.IsNotExist(err) {
 		fmt.Printf("%s✖  Error: Schema file %q does not exist.%s\n", colorRed+colorBold, schemaFile, colorReset)
@@ -551,6 +731,16 @@ func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
 	if _, err := os.Stat(envFile); os.IsNotExist(err) {
 		fmt.Printf("%s✖  Error: Environment file %q does not exist.%s\n", colorRed+colorBold, envFile, colorReset)
 		return false
+	}
+
+	// Warn if paths are identical
+	if filepath.Clean(envFile) == filepath.Clean(schemaFile) {
+		fmt.Printf("%s⚠️  Warning: Environment file and Schema file are pointing to the same file path (%s).\n   You should validate your .env against a schema template (like .env.example).\n   Because the schema has no comments, all variables default to string checks and pass.%s\n\n", colorYellow, envFile, colorReset)
+	} else {
+		// Warn if file contents are identical (security leak check)
+		if fileContentsEqual(envFile, schemaFile) {
+			fmt.Printf("%s⚠️  Security Warning: The contents of %q and %q are identical!\n   This suggests you might have committed production credentials/secrets to your schema template.\n   Please ensure your schema template (.env.example) only contains placeholders (e.g. PORT=) and no actual secrets.%s\n\n", colorYellow, envFile, schemaFile, colorReset)
+		}
 	}
 
 	// Parse
@@ -566,9 +756,12 @@ func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
 		return false
 	}
 
-	results := Validate(exampleVars, envVars)
+	results := Validate(exampleVars, envVars, cfg)
 
 	fmt.Printf("🔍  Checking %s against schema %s...\n\n", envFile, schemaFile)
+
+	fmt.Printf("  %s%-8s %-22s %-10s %-16s %-30s%s\n", colorBold, "STATUS", "VARIABLE NAME", "TYPE", "VALUE", "CHECK DETAILS", colorReset)
+	fmt.Println("  " + strings.Repeat("─", 90))
 
 	numPass := 0
 	numFail := 0
@@ -582,21 +775,45 @@ func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
 		}
 		printedKeys[r.Key] = true
 
+		varType := "string"
+		if schema, exists := exampleVars[r.Key]; exists && schema.Type != "" {
+			varType = schema.Type
+		}
+
+		maskedVal := "[MISSING]"
+		if envVal, exists := envVars[r.Key]; exists {
+			maskedVal = maskValue(envVal.DefaultValue)
+		}
+
+		var statusStr string
+		var detailsStr string
+		var rowColor string
+
 		switch r.Status {
 		case StatusOk:
-			varType := "string"
-			if schema, exists := exampleVars[r.Key]; exists && schema.Type != "" {
-				varType = schema.Type
-			}
-			fmt.Printf("  %s✔%s  %s %sis valid (%s)%s\n", colorGreen+colorBold, colorReset, r.Key, colorBold, varType, colorReset)
+			statusStr = "✔ PASS"
+			detailsStr = "Checks passed"
+			rowColor = colorGreen
 			numPass++
 		case StatusFail:
-			fmt.Printf("  %s✖%s  %s %s%s%s\n", colorRed+colorBold, colorReset, r.Key, colorRed, r.Message, colorReset)
+			statusStr = "✖ FAIL"
+			detailsStr = r.Message
+			rowColor = colorRed
 			numFail++
 		case StatusWarn:
-			fmt.Printf("  %s⚠%s  %s %s%s%s\n", colorYellow+colorBold, colorReset, r.Key, colorYellow, r.Message, colorReset)
+			statusStr = "⚠ WARN"
+			detailsStr = r.Message
+			rowColor = colorYellow
 			numWarn++
 		}
+
+		if r.Status == StatusFail && (strings.Contains(r.Message, "🚨") || strings.Contains(r.Message, "CRITICAL")) {
+			statusStr = "🚨 CRIT"
+			rowColor = colorRed + colorBold
+		}
+
+		fmt.Printf("  %s%-8s %-22s %-10s %-16s %-30s%s\n", 
+			rowColor, statusStr, r.Key, varType, maskedVal, detailsStr, colorReset)
 	}
 
 	for _, schemaVar := range exampleVars {
@@ -614,6 +831,12 @@ func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
 	if isStrict && numWarn > 0 {
 		isSuccess = false
 	}
+
+	// Render breakdown bar chart
+	printVisualProgress(numPass, numFail, numWarn)
+
+	// Render suggestions for errors/warnings
+	printActionableSuggestions(results)
 
 	fmt.Println()
 	if isSuccess {
@@ -633,40 +856,40 @@ func validateInteractive(envFile, schemaFile string, isStrict bool) bool {
 	return isSuccess
 }
 
-func runValidateInteractiveShell(args []string) {
+func runValidateInteractiveShell(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
-	envPath := fs.String("env", ".env", "Path to .env file")
-	envShort := fs.String("e", ".env", "Path to .env file (shorthand)")
-	examplePath := fs.String("example", ".env.example", "Path to schema file")
-	exampleShort := fs.String("x", ".env.example", "Path to schema file (shorthand)")
-	strict := fs.Bool("strict", false, "Strict mode: treat warnings as errors")
-	strictShort := fs.Bool("s", false, "Strict mode (shorthand)")
+	envPath := fs.String("env", cfg.EnvFile, "Path to .env file")
+	envShort := fs.String("e", cfg.EnvFile, "Path to .env file (shorthand)")
+	examplePath := fs.String("example", cfg.ExampleFile, "Path to schema file")
+	exampleShort := fs.String("x", cfg.ExampleFile, "Path to schema file (shorthand)")
+	strict := fs.Bool("strict", cfg.Strict, "Strict mode: treat warnings as errors")
+	strictShort := fs.Bool("s", cfg.Strict, "Strict mode (shorthand)")
 
 	if err := fs.Parse(args); err != nil {
 		return
 	}
 
 	finalEnv := cleanPath(*envPath)
-	if *envShort != ".env" {
+	if *envShort != cfg.EnvFile {
 		finalEnv = cleanPath(*envShort)
 	}
 	finalExample := cleanPath(*examplePath)
-	if *exampleShort != ".env.example" {
+	if *exampleShort != cfg.ExampleFile {
 		finalExample = cleanPath(*exampleShort)
 	}
 	finalStrict := *strict || *strictShort
 
-	validateInteractive(finalEnv, finalExample, finalStrict)
+	validateInteractive(finalEnv, finalExample, finalStrict, cfg)
 }
 
-func runGenerateInteractiveShell(args []string) {
+func runGenerateInteractiveShell(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("generate", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "Directory to scan recursively")
 	dirShort := fs.String("d", ".", "Directory to scan recursively (shorthand)")
-	output := fs.String("output", ".env.example", "Path to output schema")
-	outputShort := fs.String("o", ".env.example", "Path to output schema (shorthand)")
-	exclude := fs.String("exclude", "node_modules,.git,venv,__pycache__,dist,build", "Comma-separated ignore list")
-	excludeShort := fs.String("x", "node_modules,.git,venv,__pycache__,dist,build", "Comma-separated ignore list (shorthand)")
+	output := fs.String("output", cfg.ExampleFile, "Path to output schema")
+	outputShort := fs.String("o", cfg.ExampleFile, "Path to output schema (shorthand)")
+	exclude := fs.String("exclude", strings.Join(cfg.Exclude, ","), "Comma-separated ignore list")
+	excludeShort := fs.String("x", strings.Join(cfg.Exclude, ","), "Comma-separated ignore list (shorthand)")
 
 	if err := fs.Parse(args); err != nil {
 		return
@@ -677,11 +900,11 @@ func runGenerateInteractiveShell(args []string) {
 		finalDir = cleanPath(*dirShort)
 	}
 	finalOutput := cleanPath(*output)
-	if *outputShort != ".env.example" {
+	if *outputShort != cfg.ExampleFile {
 		finalOutput = cleanPath(*outputShort)
 	}
 	finalExclude := *exclude
-	if *excludeShort != "node_modules,.git,venv,__pycache__,dist,build" {
+	if *excludeShort != strings.Join(cfg.Exclude, ",") {
 		finalExclude = *excludeShort
 	}
 
@@ -692,7 +915,7 @@ func runGenerateInteractiveShell(args []string) {
 
 	fmt.Printf("🔍  Scanning %s recursively for variables...\n", finalDir)
 
-	scannedKeys, err := ScanProject(finalDir, excludesList)
+	scannedKeys, err := ScanProject(finalDir, excludesList, cfg)
 	if err != nil {
 		fmt.Printf("  ✖  Error scanning project: %v\n", err)
 		return
@@ -717,14 +940,39 @@ func runGenerateInteractiveShell(args []string) {
 	}
 }
 
-func runValidate(args []string) {
+func runAuditInteractiveShell(args []string, cfg *Config) {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	dir := fs.String("dir", ".", "Directory to audit recursively")
+	dirShort := fs.String("d", ".", "Directory to audit recursively (shorthand)")
+
+	if err := fs.Parse(args); err != nil {
+		return
+	}
+
+	finalDir := cleanPath(*dir)
+	if *dirShort != "." {
+		finalDir = cleanPath(*dirShort)
+	}
+
+	fmt.Printf("🔍  Running static security audit on: %s ...\n", finalDir)
+
+	findings, err := RunAudit(finalDir, cfg)
+	if err != nil {
+		fmt.Printf("  ✖  Error running security audit: %v\n", err)
+		return
+	}
+
+	PrintAuditReport(findings)
+}
+
+func runValidate(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
-	envPath := fs.String("env", ".env", "Path to the actual .env file")
-	envShort := fs.String("e", ".env", "Path to the actual .env file (shorthand)")
-	examplePath := fs.String("example", ".env.example", "Path to the schema .env.example file")
-	exampleShort := fs.String("x", ".env.example", "Path to the schema .env.example file (shorthand)")
-	strict := fs.Bool("strict", false, "Strict mode: treat warnings as errors")
-	strictShort := fs.Bool("s", false, "Strict mode (shorthand)")
+	envPath := fs.String("env", cfg.EnvFile, "Path to the actual .env file")
+	envShort := fs.String("e", cfg.EnvFile, "Path to the actual .env file (shorthand)")
+	examplePath := fs.String("example", cfg.ExampleFile, "Path to the schema .env.example file")
+	exampleShort := fs.String("x", cfg.ExampleFile, "Path to the schema .env.example file (shorthand)")
+	strict := fs.Bool("strict", cfg.Strict, "Strict mode: treat warnings as errors")
+	strictShort := fs.Bool("s", cfg.Strict, "Strict mode (shorthand)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: envsentry validate [options]")
@@ -737,16 +985,16 @@ func runValidate(args []string) {
 	}
 
 	finalEnv := cleanPath(*envPath)
-	if *envShort != ".env" {
+	if *envShort != cfg.EnvFile {
 		finalEnv = cleanPath(*envShort)
 	}
 	finalExample := cleanPath(*examplePath)
-	if *exampleShort != ".env.example" {
+	if *exampleShort != cfg.ExampleFile {
 		finalExample = cleanPath(*exampleShort)
 	}
 	finalStrict := *strict || *strictShort
 
-	success := validateInteractive(finalEnv, finalExample, finalStrict)
+	success := validateInteractive(finalEnv, finalExample, finalStrict, cfg)
 	if success {
 		os.Exit(0)
 	} else {
@@ -754,14 +1002,14 @@ func runValidate(args []string) {
 	}
 }
 
-func runGenerate(args []string) {
+func runGenerate(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	dir := fs.String("dir", ".", "Directory to scan recursively")
 	dirShort := fs.String("d", ".", "Directory to scan recursively (shorthand)")
-	output := fs.String("output", ".env.example", "Path to output the generated .env.example")
-	outputShort := fs.String("o", ".env.example", "Path to output the generated .env.example (shorthand)")
-	exclude := fs.String("exclude", "node_modules,.git,venv,__pycache__,dist,build", "Comma-separated list of directories to ignore")
-	excludeShort := fs.String("x", "node_modules,.git,venv,__pycache__,dist,build", "Comma-separated list of directories to ignore (shorthand)")
+	output := fs.String("output", cfg.ExampleFile, "Path to output the generated .env.example")
+	outputShort := fs.String("o", cfg.ExampleFile, "Path to output the generated .env.example (shorthand)")
+	exclude := fs.String("exclude", strings.Join(cfg.Exclude, ","), "Comma-separated list of directories to ignore")
+	excludeShort := fs.String("x", strings.Join(cfg.Exclude, ","), "Comma-separated list of directories to ignore (shorthand)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: envsentry generate [options]")
@@ -778,11 +1026,11 @@ func runGenerate(args []string) {
 		finalDir = cleanPath(*dirShort)
 	}
 	finalOutput := cleanPath(*output)
-	if *outputShort != ".env.example" {
+	if *outputShort != cfg.ExampleFile {
 		finalOutput = cleanPath(*outputShort)
 	}
 	finalExclude := *exclude
-	if *excludeShort != "node_modules,.git,venv,__pycache__,dist,build" {
+	if *excludeShort != strings.Join(cfg.Exclude, ",") {
 		finalExclude = *excludeShort
 	}
 
@@ -793,7 +1041,7 @@ func runGenerate(args []string) {
 
 	fmt.Printf("\n🔍  Scanning %s recursively for variables...\n", finalDir)
 
-	scannedKeys, err := ScanProject(finalDir, excludesList)
+	scannedKeys, err := ScanProject(finalDir, excludesList, cfg)
 	if err != nil {
 		fmt.Printf("  ✖  Error scanning project: %v\n", err)
 		os.Exit(1)
@@ -817,4 +1065,48 @@ func runGenerate(args []string) {
 	} else {
 		fmt.Printf("✔  Updated %s! (All scanned keys were already present)\n", finalOutput)
 	}
+}
+
+func runAuditSubcommand(args []string, cfg *Config) {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	dir := fs.String("dir", ".", "Directory to audit recursively")
+	dirShort := fs.String("d", ".", "Directory to audit recursively (shorthand)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: envsentry audit [options]")
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	finalDir := cleanPath(*dir)
+	if *dirShort != "." {
+		finalDir = cleanPath(*dirShort)
+	}
+
+	fmt.Printf("\n🔍  Running static security audit on directory: %s ...\n", finalDir)
+
+	findings, err := RunAudit(finalDir, cfg)
+	if err != nil {
+		fmt.Printf("  ✖  Error running security audit: %v\n", err)
+		os.Exit(1)
+	}
+
+	PrintAuditReport(findings)
+
+	// If critical vulnerabilities are found, exit with non-zero code for pipeline checks
+	numCritical := 0
+	for _, f := range findings {
+		if f.Severity == "CRITICAL" {
+			numCritical++
+		}
+	}
+
+	if numCritical > 0 {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
